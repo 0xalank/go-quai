@@ -245,6 +245,7 @@ func (s *Server) handleConn(c net.Conn) {
 				sess.chain = "sha"
 			}
 			sess.authorized = true
+			s.logger.WithFields(log.Fields{"user": sess.user, "chain": sess.chain, "powID": powIDFromChain(sess.chain)}).Info("miner authorized")
 			_ = enc.Encode(stratumResp{ID: req.ID, Result: true, Error: nil})
 			// Send a fresh job with miner difficulty based on SHA workshare diff
 			if err := s.sendJobAndNotify(sess); err != nil {
@@ -407,8 +408,10 @@ func (s *Server) handleConn(c net.Conn) {
 func (s *Server) sendJobAndNotify(sess *session) error {
 	// Kawpow uses a different stratum format
 	if powIDFromChain(sess.chain) == types.Kawpow {
+		s.logger.WithField("chain", sess.chain).Debug("routing to kawpow stratum")
 		return s.sendKawpowJob(sess)
 	}
+	s.logger.WithField("chain", sess.chain).Debug("routing to SHA/Scrypt stratum")
 
 	j, err := s.makeJob(sess)
 	if err != nil {

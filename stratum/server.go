@@ -35,22 +35,48 @@ func (randReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Algorithm represents the mining algorithm for a stratum server
+type Algorithm string
+
+const (
+	AlgoSHA    Algorithm = "sha"
+	AlgoScrypt Algorithm = "scrypt"
+	AlgoKawPoW Algorithm = "kawpow"
+)
+
 // Stratum v1 server implementing subscribe/authorize/notify/submit using AuxPow from getPendingHeader.
 type Server struct {
-	addr    string
-	backend quaiapi.Backend
-	ln      net.Listener
-	logger  *logrus.Logger
-	stats   *PoolStats
+	addr      string
+	algorithm Algorithm // Algorithm this server handles (empty = all)
+	backend   quaiapi.Backend
+	ln        net.Listener
+	logger    *logrus.Logger
+	stats     *PoolStats
 	// simple counters for debugging submission quality
 	submits      uint64
 	passPowCount uint64
 	passRelCount uint64
 }
 
+// NewServer creates a new stratum server (handles all algorithms - legacy mode)
 func NewServer(addr string, backend quaiapi.Backend) *Server {
+	return NewServerWithAlgorithm(addr, "", backend, nil)
+}
+
+// NewServerWithAlgorithm creates a new stratum server for a specific algorithm
+func NewServerWithAlgorithm(addr string, algo Algorithm, backend quaiapi.Backend, sharedStats *PoolStats) *Server {
 	logger := log.NewLogger("stratum.log", viper.GetString(utils.LogLevelFlag.Name), viper.GetInt(utils.LogSizeFlag.Name))
-	return &Server{addr: addr, backend: backend, logger: logger, stats: NewPoolStats()}
+	stats := sharedStats
+	if stats == nil {
+		stats = NewPoolStats()
+	}
+	return &Server{
+		addr:      addr,
+		algorithm: algo,
+		backend:   backend,
+		logger:    logger,
+		stats:     stats,
+	}
 }
 
 // Stats returns the pool statistics tracker
@@ -145,7 +171,8 @@ type job struct {
 
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(60 * time.Second))
+	// Set a longer initial deadline - will be extended on each message
+	_ = c.SetDeadline(time.Now().Add(5 * time.Minute))
 	dec := json.NewDecoder(bufio.NewReader(c))
 	enc := json.NewEncoder(c)
 	sess := &session{
@@ -178,6 +205,9 @@ func (s *Server) handleConn(c net.Conn) {
 			}
 			return
 		}
+		// Extend deadline on each message received
+		_ = c.SetDeadline(time.Now().Add(5 * time.Minute))
+
 		switch req.Method {
 		case "mining.subscribe":
 			// result: [[subscriptions], extranonce1, extranonce2_size]
@@ -253,7 +283,12 @@ func (s *Server) handleConn(c net.Conn) {
 					}
 				}
 			}
-			if len(req.Params) >= 2 {
+			// Determine algorithm: server-specific takes precedence, then password, then default
+			if s.algorithm != "" {
+				// Server is algorithm-specific, force that algorithm
+				sess.chain = string(s.algorithm)
+			} else if len(req.Params) >= 2 {
+				// Legacy mode: use password field for algorithm selection
 				if p, ok := req.Params[1].(string); ok {
 					sess.chain = strings.ToLower(p)
 				}
@@ -262,6 +297,7 @@ func (s *Server) handleConn(c net.Conn) {
 				sess.chain = "sha"
 			}
 			sess.authorized = true
+			s.stats.WorkerConnected(sess.user, sess.workerName, sess.chain)
 			s.logger.WithFields(log.Fields{"user": sess.user, "chain": sess.chain, "powID": powIDFromChain(sess.chain)}).Info("miner authorized")
 			_ = enc.Encode(stratumResp{ID: req.ID, Result: true, Error: nil})
 			// Send a fresh job with miner difficulty based on SHA workshare diff
@@ -398,7 +434,7 @@ func (s *Server) handleConn(c net.Conn) {
 				s.stats.ShareSubmitted(sess.user, sess.workerName, sess.difficulty, false, false) // invalid share
 				_ = enc.Encode(stratumResp{ID: req.ID, Result: false, Error: err.Error()})
 			} else {
-				s.stats.ShareSubmitted(sess.user, sess.workerName, sess.difficulty, true, false) // valid share
+				// Note: valid share is already recorded in submitAsWorkShare with difficulty info
 				s.logger.WithFields(log.Fields{"addr": sess.user, "chain": sess.chain, "nonce": nonceHex}).Info("submit accepted")
 				// Mark this job ID as consumed to prevent duplicate submissions
 				sess.mu.Lock()
@@ -455,64 +491,27 @@ func (s *Server) sendJobAndNotify(sess *session) error {
 	sess.mu.Unlock()
 	s.logger.WithFields(log.Fields{"jobID": j.id, "chain": sess.chain}).Info("notify job")
 
-	// Compute stratum difficulty. Two mappings are common:
-	// 1) Exact mapping against Bitcoin diff1 target: D = diff1 * ShaDiff / maxHash (minerTarget == workShareTarget)
-	// 2) Pool/alt mapping used by some miners/pools: D = ShaDiff / 65536 (assumes diff1' := maxHash >> 32)
-	// For now we use (2) to keep miner share rates sane without needing explicit diff1 constants.
-	d := 1e-10 // fallback
+	// Use algorithm-specific pool difficulties for reasonable share submission rates
+	// These are much lower than workshare difficulties so miners submit frequently
+	var poolDiff float64
 	switch powIDFromChain(sess.chain) {
 	case types.SHA_BTC, types.SHA_BCH:
-		if j.pending != nil && j.pending.WorkObjectHeader() != nil && j.pending.WorkObjectHeader().ShaDiffAndCount() != nil && j.pending.WorkObjectHeader().ShaDiffAndCount().Difficulty() != nil {
-			sd := j.pending.WorkObjectHeader().ShaDiffAndCount().Difficulty()
-			// Map Quai workshare difficulty to Stratum difficulty using alt mapping D = diff/65536
-			// Use big.Float to avoid overflow and convert to float64 for the Stratum call
-			diffF, _ := new(big.Float).Quo(new(big.Float).SetInt(sd), big.NewFloat(2e32)).Float64()
-			if diffF <= 0 {
-				diffF = d
-			}
-			// Protect concurrent writes to session fields
-			sess.mu.Lock()
-			sess.difficulty = diffF
-			sess.mu.Unlock()
-
-			s.logger.WithFields(log.Fields{"ShaDiff": sd.String(), "minerDiff": diffF}).Debug("sendJobAndNotify SHA diff")
-		} else {
-			s.logger.WithField("fallback", d).Debug("sendJobAndNotify: No SHA diff available, using fallback")
-		}
+		// SHA pool difficulty - for Bitaxe (~500 GH/s), diff 1000 = ~1 share/8 sec
+		poolDiff = 1000.0
 	case types.Scrypt:
-		if j.pending != nil && j.pending.WorkObjectHeader() != nil && j.pending.WorkObjectHeader().ScryptDiffAndCount() != nil && j.pending.WorkObjectHeader().ScryptDiffAndCount().Difficulty() != nil {
-			sd := j.pending.WorkObjectHeader().ScryptDiffAndCount().Difficulty()
-			// Classic Scrypt pool behavior: Stratum difficulty D = sd / 65536
-			diffF, _ := new(big.Float).Quo(new(big.Float).SetInt(sd), big.NewFloat(65536)).Float64()
-			if diffF <= 0 {
-				diffF = d
-			}
-			sess.mu.Lock()
-			sess.difficulty = diffF
-			sess.mu.Unlock()
-			s.logger.WithFields(log.Fields{"ScryptDiff": sd.String(), "minerDiff": diffF}).Debug("sendJobAndNotify Scrypt diff")
-		} else {
-			s.logger.WithField("fallback", d).Debug("sendJobAndNotify: No Scrypt diff available, using fallback")
-		}
+		// Scrypt pool difficulty - for small Scrypt miners, use lower diff
+		// Scrypt difficulty 65536 is standard "diff 1" for many pools
+		poolDiff = 65536.0
 	case types.Kawpow:
-		if j.pending != nil && j.pending.WorkObjectHeader() != nil && j.pending.WorkObjectHeader().KawpowDifficulty() != nil {
-			kd := j.pending.WorkObjectHeader().KawpowDifficulty()
-			// Kawpow difficulty mapping similar to SHA
-			diffF, _ := new(big.Float).Quo(new(big.Float).SetInt(kd), big.NewFloat(2e32)).Float64()
-			if diffF <= 0 {
-				diffF = d
-			}
-			sess.mu.Lock()
-			sess.difficulty = diffF
-			sess.mu.Unlock()
-			s.logger.WithFields(log.Fields{"KawpowDiff": kd.String(), "minerDiff": diffF}).Debug("sendJobAndNotify Kawpow diff")
-		} else {
-			s.logger.WithField("fallback", d).Debug("sendJobAndNotify: No Kawpow diff available, using fallback")
-		}
+		// KawPoW pool difficulty - for 50 MH/s GPU, diff 10M = ~5 shares/sec
+		poolDiff = 10000000.0
 	default:
-		// keep fallback for non-SHA donor algos
-		s.logger.WithFields(log.Fields{"chain": sess.chain, "fallback": d}).Debug("sendJobAndNotify: Non-SHA/Scrypt chain, using fallback")
+		poolDiff = 1000.0
 	}
+	sess.mu.Lock()
+	sess.difficulty = poolDiff
+	sess.mu.Unlock()
+	s.logger.WithFields(log.Fields{"chain": sess.chain, "poolDiff": poolDiff}).Debug("sendJobAndNotify using pool difficulty")
 
 	// Send set_difficulty (and set_target for miners that honor it) then the job notify
 	sess.mu.Lock()
@@ -817,14 +816,23 @@ func (s *Server) submitAsWorkShare(sess *session, ex2hex, ntimeHex, nonceHex, ve
 	pending.WorkObjectHeader().AuxPow().SetHeader(templateHeader)
 	pending.WorkObjectHeader().AuxPow().SetTransaction(fullCoinb)
 
-	//bytes := pending.Hash().Bytes()
-	// fmt.Printf("[stratum] header %x\n", templateHeader.Bytes())
-	// fmt.Printf("[stratum] pow hash %x\n", hashBytes)
-	// fmt.Printf("[stratum] workshare hash %x\n", bytes)
+	// Pool difficulty: use algorithm-specific difficulties for hashrate tracking
+	// These are much lower than workshare difficulty so miners can submit shares frequently
+	var poolDifficulty *big.Int
+	switch pending.AuxPow().PowID() {
+	case types.Scrypt:
+		poolDifficulty = big.NewInt(65536)
+	case types.Kawpow:
+		poolDifficulty = big.NewInt(10000000)
+	default:
+		// SHA
+		poolDifficulty = big.NewInt(1000)
+	}
+	poolTarget := new(big.Int).Div(common.Big2e256, poolDifficulty)
 
-	// Check if satisfies workShareTarget
-	if powHashBigInt.Cmp(workShareTarget) > 0 {
-		return fmt.Errorf("did not meet thresold")
+	// First check: does the share meet pool difficulty?
+	if powHashBigInt.Cmp(poolTarget) > 0 {
+		return fmt.Errorf("did not meet pool difficulty")
 	}
 
 	// LRU de-dup: reject identical shares (same pow hash) for this session
@@ -845,9 +853,36 @@ func (s *Server) submitAsWorkShare(sess *session, ex2hex, ntimeHex, nonceHex, ve
 	}
 	sess.mu.Unlock()
 
-	s.logger.WithFields(log.Fields{"powID": pending.AuxPow().PowID(), "achievedDiff": achievedDiff.String(), "hashBytes": hex.EncodeToString(hashBytes)}).Info("workshare received")
+	// Share is valid for pool stats (hashrate tracking)
+	s.logger.WithFields(log.Fields{"powID": pending.AuxPow().PowID(), "achievedDiff": achievedDiff.String()}).Debug("pool share accepted")
 
-	return s.backend.ReceiveMinedHeader(pending)
+	// Get algorithm name for stats
+	var algoName string
+	switch pending.AuxPow().PowID() {
+	case types.Scrypt:
+		algoName = "scrypt"
+	case types.Kawpow:
+		algoName = "kawpow"
+	default:
+		algoName = "sha"
+	}
+
+	// Get workshare difficulty as float
+	workshareDiff := new(big.Float).SetInt(new(big.Int).Div(common.Big2e256, workShareTarget))
+	workshareDiffFloat, _ := workshareDiff.Float64()
+	achievedDiffFloat, _ := new(big.Float).SetInt(achievedDiff).Float64()
+	poolDiffFloat, _ := new(big.Float).SetInt(poolDifficulty).Float64()
+
+	// Record the share with difficulty info for solo mining luck tracking
+	s.stats.ShareSubmittedWithDiff(sess.user, sess.workerName, algoName, poolDiffFloat, achievedDiffFloat, workshareDiffFloat, true, false)
+
+	// Second check: does it also meet workshare target? If so, submit to network
+	if powHashBigInt.Cmp(workShareTarget) <= 0 {
+		s.logger.WithFields(log.Fields{"powID": pending.AuxPow().PowID(), "achievedDiff": achievedDiff.String(), "hashBytes": hex.EncodeToString(hashBytes)}).Info("workshare received - submitting to network")
+		return s.backend.ReceiveMinedHeader(pending)
+	}
+
+	return nil
 }
 
 // submitKawpowShare handles kawpow share submissions
@@ -938,6 +973,15 @@ func (s *Server) submitKawpowShare(sess *session, kawJob *kawpowJob, nonceHex, h
 	pending.WorkObjectHeader().SetMixHash(common.Hash(mixHashArray))
 
 	achievedDiff := new(big.Int).Div(common.Big2e256, mixHashInt)
+
+	// Get workshare difficulty for stats
+	workshareDiffFloat, _ := new(big.Float).SetInt(pending.WorkObjectHeader().KawpowDifficulty()).Float64()
+	achievedDiffFloat, _ := new(big.Float).SetInt(achievedDiff).Float64()
+	poolDiff := float64(10000000) // kawpow pool difficulty
+
+	// Record the share with difficulty info
+	s.stats.ShareSubmittedWithDiff(sess.user, sess.workerName, "kawpow", poolDiff, achievedDiffFloat, workshareDiffFloat, true, false)
+
 	s.logger.WithFields(log.Fields{
 		"powID":        types.Kawpow,
 		"height":       kawJob.height,

@@ -8,9 +8,12 @@ import (
 
 // TopMiner represents a miner's aggregated stats for leaderboard
 type TopMiner struct {
-	Address     string  `json:"address"`
-	Hashrate    float64 `json:"hashrate"`
-	WorkerCount int     `json:"workerCount"`
+	Address        string  `json:"address"`
+	Hashrate       float64 `json:"hashrate"`
+	HashrateSHA    float64 `json:"hashrateSha"`
+	HashrateScrypt float64 `json:"hashrateScrypt"`
+	HashrateKawPoW float64 `json:"hashrateKawpow"`
+	WorkerCount    int     `json:"workerCount"`
 }
 
 // WorkerStats tracks statistics for a connected miner
@@ -38,6 +41,17 @@ type BlockFound struct {
 	FoundAt     time.Time `json:"foundAt"`
 }
 
+// ShareRecord tracks an individual share submission with difficulty info
+type ShareRecord struct {
+	Timestamp          time.Time `json:"timestamp"`
+	Worker             string    `json:"worker"`
+	Algorithm          string    `json:"algorithm"`
+	AchievedDifficulty float64   `json:"achievedDifficulty"` // actual difficulty of the share
+	WorkshareDiff      float64   `json:"workshareDiff"`      // target difficulty for a block
+	LuckPercent        float64   `json:"luckPercent"`        // achievedDiff / workshareDiff * 100
+	IsBlock            bool      `json:"isBlock"`            // true if this share found a block
+}
+
 // PoolStats aggregates all pool statistics
 type PoolStats struct {
 	workers     map[string]*WorkerStats
@@ -47,8 +61,11 @@ type PoolStats struct {
 	mu          sync.RWMutex
 
 	// Hashrate calculation
-	shareWindow     []shareEvent
-	windowDuration  time.Duration
+	shareWindow    []shareEvent
+	windowDuration time.Duration
+
+	// Share history for solo mining luck tracking
+	shareHistory []ShareRecord
 }
 
 type shareEvent struct {
@@ -64,6 +81,7 @@ func NewPoolStats() *PoolStats {
 		startedAt:      time.Now(),
 		shareWindow:    make([]shareEvent, 0),
 		windowDuration: 10 * time.Minute,
+		shareHistory:   make([]ShareRecord, 0),
 	}
 }
 
@@ -82,6 +100,12 @@ func (ps *PoolStats) WorkerConnected(address, workerName, algorithm string) {
 	if worker, exists := ps.workers[key]; exists {
 		worker.IsConnected = true
 		worker.ConnectedAt = time.Now()
+		// Reset stats on reconnect to avoid hashrate spikes
+		// (old shares with new short time window = inflated hashrate)
+		worker.SharesValid = 0
+		worker.SharesStale = 0
+		worker.SharesInvalid = 0
+		worker.Hashrate = 0
 		if algorithm != "" {
 			worker.Algorithm = algorithm
 		}
@@ -113,6 +137,11 @@ func (ps *PoolStats) WorkerDisconnected(address, workerName string) {
 
 // ShareSubmitted records a share submission
 func (ps *PoolStats) ShareSubmitted(address, workerName string, difficulty float64, valid bool, stale bool) {
+	ps.ShareSubmittedWithDiff(address, workerName, "", difficulty, 0, 0, valid, stale)
+}
+
+// ShareSubmittedWithDiff records a share with detailed difficulty information for solo mining
+func (ps *PoolStats) ShareSubmittedWithDiff(address, workerName, algorithm string, poolDiff, achievedDiff, workshareDiff float64, valid bool, stale bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -121,7 +150,7 @@ func (ps *PoolStats) ShareSubmitted(address, workerName string, difficulty float
 	// Record share for hashrate calculation
 	ps.shareWindow = append(ps.shareWindow, shareEvent{
 		timestamp:  time.Now(),
-		difficulty: difficulty,
+		difficulty: poolDiff,
 	})
 	ps.pruneShareWindow()
 
@@ -132,7 +161,7 @@ func (ps *PoolStats) ShareSubmitted(address, workerName string, difficulty float
 
 	if worker, exists := ps.workers[key]; exists {
 		worker.LastShareAt = time.Now()
-		worker.Difficulty = difficulty
+		worker.Difficulty = poolDiff
 		if valid {
 			worker.SharesValid++
 		} else if stale {
@@ -141,6 +170,28 @@ func (ps *PoolStats) ShareSubmitted(address, workerName string, difficulty float
 			worker.SharesInvalid++
 		}
 		worker.Hashrate = ps.calculateWorkerHashrate(key)
+	}
+
+	// Record share in history for solo mining luck tracking (only valid shares)
+	if valid && achievedDiff > 0 && workshareDiff > 0 {
+		luckPercent := (achievedDiff / workshareDiff) * 100
+		isBlock := achievedDiff >= workshareDiff
+
+		record := ShareRecord{
+			Timestamp:          time.Now(),
+			Worker:             key,
+			Algorithm:          algorithm,
+			AchievedDifficulty: achievedDiff,
+			WorkshareDiff:      workshareDiff,
+			LuckPercent:        luckPercent,
+			IsBlock:            isBlock,
+		}
+		ps.shareHistory = append(ps.shareHistory, record)
+
+		// Keep only last 500 shares to avoid memory bloat
+		if len(ps.shareHistory) > 500 {
+			ps.shareHistory = ps.shareHistory[len(ps.shareHistory)-500:]
+		}
 	}
 }
 
@@ -234,6 +285,30 @@ func (ps *PoolStats) GetBlocks() []BlockFound {
 	return blocks
 }
 
+// GetShareHistory returns recent share records with difficulty info
+func (ps *PoolStats) GetShareHistory() []ShareRecord {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	history := make([]ShareRecord, len(ps.shareHistory))
+	copy(history, ps.shareHistory)
+	return history
+}
+
+// GetShareHistoryByAlgorithm returns share history filtered by algorithm
+func (ps *PoolStats) GetShareHistoryByAlgorithm(algorithm string) []ShareRecord {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	history := make([]ShareRecord, 0)
+	for _, s := range ps.shareHistory {
+		if s.Algorithm == algorithm {
+			history = append(history, s)
+		}
+	}
+	return history
+}
+
 // GetOverview returns summary statistics
 func (ps *PoolStats) GetOverview() PoolOverview {
 	ps.mu.RLock()
@@ -243,7 +318,26 @@ func (ps *PoolStats) GetOverview() PoolOverview {
 	var totalHashrate float64
 	var totalValidShares, totalStaleShares, totalInvalidShares uint64
 
+	// Per-algorithm stats
+	algoStats := map[string]*AlgorithmStats{
+		"sha":    {},
+		"scrypt": {},
+		"kawpow": {},
+	}
+
 	for _, w := range ps.workers {
+		algo := w.Algorithm
+		if algo == "" {
+			algo = "sha" // default
+		}
+		if stats, ok := algoStats[algo]; ok {
+			if w.IsConnected {
+				stats.Hashrate += w.Hashrate
+				stats.Workers++
+			}
+			stats.SharesValid += w.SharesValid
+		}
+
 		if w.IsConnected {
 			connected++
 			totalHashrate += w.Hashrate
@@ -252,6 +346,8 @@ func (ps *PoolStats) GetOverview() PoolOverview {
 		totalStaleShares += w.SharesStale
 		totalInvalidShares += w.SharesInvalid
 	}
+
+	// Network stats are fetched via RPC in the API layer, not calculated here
 
 	return PoolOverview{
 		WorkersTotal:     len(ps.workers),
@@ -263,7 +359,19 @@ func (ps *PoolStats) GetOverview() PoolOverview {
 		BlocksFound:      len(ps.blocks),
 		Uptime:           time.Since(ps.startedAt).Seconds(),
 		StartedAt:        ps.startedAt,
+		SHA:              *algoStats["sha"],
+		Scrypt:           *algoStats["scrypt"],
+		KawPoW:           *algoStats["kawpow"],
 	}
+}
+
+// AlgorithmStats contains per-algorithm statistics
+type AlgorithmStats struct {
+	Hashrate          float64 `json:"hashrate"`
+	NetworkDifficulty float64 `json:"networkDifficulty"`
+	NetworkHashrate   float64 `json:"networkHashrate"`
+	Workers           int     `json:"workers"`
+	SharesValid       uint64  `json:"sharesValid"`
 }
 
 // PoolOverview contains summary statistics
@@ -280,6 +388,11 @@ type PoolOverview struct {
 	NetworkHashrate   float64    `json:"networkHashrate,omitempty"`
 	NetworkDifficulty float64    `json:"networkDifficulty,omitempty"`
 	TopMiners         []TopMiner `json:"topMiners,omitempty"`
+
+	// Per-algorithm stats
+	SHA    AlgorithmStats `json:"sha"`
+	Scrypt AlgorithmStats `json:"scrypt"`
+	KawPoW AlgorithmStats `json:"kawpow"`
 }
 
 // pruneShareWindow removes old share events outside the window
@@ -296,8 +409,8 @@ func (ps *PoolStats) pruneShareWindow() {
 
 // calculateWorkerHashrate estimates hashrate based on recent shares
 func (ps *PoolStats) calculateWorkerHashrate(address string) float64 {
-	// Simple estimation: (shares * difficulty) / time_window
-	// This is a rough estimate; real pools use more sophisticated methods
+	// Simple estimation: (shares * difficulty * scale) / time_window
+	// Scale factor depends on algorithm
 	worker, exists := ps.workers[address]
 	if !exists || worker.SharesValid == 0 {
 		return 0
@@ -308,9 +421,20 @@ func (ps *PoolStats) calculateWorkerHashrate(address string) float64 {
 		elapsed = 1
 	}
 
-	// Hashrate = (shares * difficulty * 2^32) / time
-	// Simplified: just use difficulty * shares / time for relative comparison
-	return float64(worker.SharesValid) * worker.Difficulty * 4294967296 / elapsed
+	// Use algorithm-specific scale factors
+	// SHA: diff 1 = 2^32 hashes
+	// Scrypt: diff 1 = 2^16 hashes (65536)
+	// KawPoW: diff 1 = 2^32 hashes
+	var scale float64
+	switch worker.Algorithm {
+	case "scrypt":
+		scale = 65536 // 2^16
+	default:
+		scale = 4294967296 // 2^32
+	}
+
+	// Hashrate = (shares * difficulty * scale) / time
+	return float64(worker.SharesValid) * worker.Difficulty * scale / elapsed
 }
 
 // GetTotalHashrate calculates pool-wide hashrate
@@ -338,15 +462,38 @@ func (ps *PoolStats) GetTopMiners(limit int) []TopMiner {
 		if !w.IsConnected {
 			continue
 		}
+		algo := w.Algorithm
+		if algo == "" {
+			algo = "sha" // default
+		}
 		if miner, exists := minerMap[w.Address]; exists {
 			miner.Hashrate += w.Hashrate
 			miner.WorkerCount++
+			// Add to algorithm-specific hashrate
+			switch algo {
+			case "sha":
+				miner.HashrateSHA += w.Hashrate
+			case "scrypt":
+				miner.HashrateScrypt += w.Hashrate
+			case "kawpow":
+				miner.HashrateKawPoW += w.Hashrate
+			}
 		} else {
-			minerMap[w.Address] = &TopMiner{
+			m := &TopMiner{
 				Address:     w.Address,
 				Hashrate:    w.Hashrate,
 				WorkerCount: 1,
 			}
+			// Set initial algorithm-specific hashrate
+			switch algo {
+			case "sha":
+				m.HashrateSHA = w.Hashrate
+			case "scrypt":
+				m.HashrateScrypt = w.Hashrate
+			case "kawpow":
+				m.HashrateKawPoW = w.Hashrate
+			}
+			minerMap[w.Address] = m
 		}
 	}
 

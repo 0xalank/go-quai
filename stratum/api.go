@@ -3,7 +3,6 @@ package stratum
 import (
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -48,6 +47,7 @@ func (a *API) Start() error {
 	// Pool-wide endpoints (dashboard)
 	mux.HandleFunc("/api/pool/stats", a.handlePoolStats)
 	mux.HandleFunc("/api/pool/blocks", a.handlePoolBlocks)
+	mux.HandleFunc("/api/pool/shares", a.handlePoolShares)
 
 	// Miner-specific endpoints (address-scoped)
 	mux.HandleFunc("/api/miner/", a.handleMiner)
@@ -112,23 +112,7 @@ func (a *API) getExtendedOverview() PoolOverview {
 	// Add top miners
 	overview.TopMiners = a.stats.GetTopMiners(20)
 
-	// Get network stats from backend
-	if a.backend != nil {
-		currentBlock := a.backend.CurrentBlock()
-		if currentBlock != nil {
-			// Get network difficulty from the current block
-			if diff := currentBlock.Difficulty(); diff != nil {
-				diffFloat, _ := new(big.Float).SetInt(diff).Float64()
-				overview.NetworkDifficulty = diffFloat
-
-				// Estimate network hashrate from difficulty
-				// Formula: hashrate = difficulty * 2^32 / blockTime
-				// Assuming ~10 second block time for Quai
-				blockTime := 10.0
-				overview.NetworkHashrate = diffFloat * 4294967296 / blockTime
-			}
-		}
-	}
+	// Network stats are fetched directly from the RPC by the frontend
 
 	return overview
 }
@@ -142,6 +126,80 @@ func (a *API) handlePoolBlocks(w http.ResponseWriter, r *http.Request) {
 
 	blocks := a.stats.GetBlocks()
 	writeJSON(w, blocks)
+}
+
+// ShareHistoryResponse contains share history with difficulty info for solo mining
+type ShareHistoryResponse struct {
+	Shares           []ShareRecord `json:"shares"`
+	WorkshareDiff    float64       `json:"workshareDiff"`    // Current workshare difficulty
+	AverageLuck      float64       `json:"averageLuck"`      // Average luck % across all shares
+	BestShareLuck    float64       `json:"bestShareLuck"`    // Best share luck %
+	TotalShares      int           `json:"totalShares"`
+	BlocksFound      int           `json:"blocksFound"`      // Shares that met workshare diff
+	ExpectedShares   float64       `json:"expectedShares"`   // Expected shares to find a block
+}
+
+// handlePoolShares returns share history with difficulty info for solo mining luck tracking
+func (a *API) handlePoolShares(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get optional algorithm filter
+	algorithm := r.URL.Query().Get("algorithm")
+
+	var shares []ShareRecord
+	if algorithm != "" {
+		shares = a.stats.GetShareHistoryByAlgorithm(algorithm)
+	} else {
+		shares = a.stats.GetShareHistory()
+	}
+
+	// Calculate aggregate stats
+	var totalLuck, bestLuck, currentWorkDiff float64
+	var blocksFound int
+
+	for _, s := range shares {
+		totalLuck += s.LuckPercent
+		if s.LuckPercent > bestLuck {
+			bestLuck = s.LuckPercent
+		}
+		if s.IsBlock {
+			blocksFound++
+		}
+		currentWorkDiff = s.WorkshareDiff // Use latest workshare diff
+	}
+
+	avgLuck := 0.0
+	if len(shares) > 0 {
+		avgLuck = totalLuck / float64(len(shares))
+	}
+
+	// Expected shares = workshare_diff / pool_diff
+	// This tells you how many shares you'd expect before finding a block
+	expectedShares := 0.0
+	if len(shares) > 0 && currentWorkDiff > 0 {
+		// Use the average achieved difficulty to estimate expected shares
+		avgAchieved := 0.0
+		for _, s := range shares {
+			avgAchieved += s.AchievedDifficulty
+		}
+		avgAchieved /= float64(len(shares))
+		if avgAchieved > 0 {
+			expectedShares = currentWorkDiff / avgAchieved
+		}
+	}
+
+	writeJSON(w, ShareHistoryResponse{
+		Shares:         shares,
+		WorkshareDiff:  currentWorkDiff,
+		AverageLuck:    avgLuck,
+		BestShareLuck:  bestLuck,
+		TotalShares:    len(shares),
+		BlocksFound:    blocksFound,
+		ExpectedShares: expectedShares,
+	})
 }
 
 // handleMiner routes miner-specific requests

@@ -626,6 +626,9 @@ var (
 var StratumFlags = []Flag{
 	StratumEnabledFlag,
 	StratumAddrFlag,
+	StratumSHAAddrFlag,
+	StratumScryptAddrFlag,
+	StratumKawPoWAddrFlag,
 	StratumAPIAddrFlag,
 }
 
@@ -635,14 +638,30 @@ var (
 		Value: false,
 		Usage: "enable TCP stratum-like endpoint to serve auxpow headers",
 	}
+	// Deprecated: use algorithm-specific flags instead
 	StratumAddrFlag = Flag{
 		Name:  c_NodeFlagPrefix + "stratum-addr",
 		Value: "0.0.0.0:3333",
-		Usage: "listen address for stratum-like TCP endpoint",
+		Usage: "listen address for stratum-like TCP endpoint (deprecated, use per-algorithm flags)",
+	}
+	StratumSHAAddrFlag = Flag{
+		Name:  c_NodeFlagPrefix + "stratum-sha-addr",
+		Value: "0.0.0.0:3333",
+		Usage: "listen address for SHA stratum endpoint",
+	}
+	StratumScryptAddrFlag = Flag{
+		Name:  c_NodeFlagPrefix + "stratum-scrypt-addr",
+		Value: "0.0.0.0:3334",
+		Usage: "listen address for Scrypt stratum endpoint",
+	}
+	StratumKawPoWAddrFlag = Flag{
+		Name:  c_NodeFlagPrefix + "stratum-kawpow-addr",
+		Value: "0.0.0.0:3335",
+		Usage: "listen address for KawPoW stratum endpoint",
 	}
 	StratumAPIAddrFlag = Flag{
 		Name:  c_NodeFlagPrefix + "stratum-api-addr",
-		Value: "0.0.0.0:3334",
+		Value: "0.0.0.0:3336",
 		Usage: "listen address for stratum pool HTTP API (serves stats to dashboard)",
 	}
 )

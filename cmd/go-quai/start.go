@@ -116,28 +116,30 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Optionally start stratum-like TCP server when enabled and a zone backend is available
-	var stratumServer *stratum.Server
-	var stratumAPI *stratum.API
+	// Optionally start stratum servers when enabled and a zone backend is available
+	var stratumManager *stratum.Manager
 	if viper.GetBool(utils.StratumEnabledFlag.Name) {
-		addr := viper.GetString(utils.StratumAddrFlag.Name)
 		if zoneBackend == nil {
 			log.Global.Warn("Stratum endpoint enabled but no processing zone backend found; skipping start")
 		} else {
-			stratumServer = stratum.NewServer(addr, zoneBackend)
-			if err := stratumServer.Start(); err != nil {
-				log.Global.WithField("error", err).Error("failed to start stratum endpoint")
-			} else {
-				log.Global.WithField("addr", addr).Info("Stratum TCP endpoint started")
+			// Create stratum manager with per-algorithm servers
+			cfg := stratum.ManagerConfig{
+				SHAAddr:    viper.GetString(utils.StratumSHAAddrFlag.Name),
+				ScryptAddr: viper.GetString(utils.StratumScryptAddrFlag.Name),
+				KawPoWAddr: viper.GetString(utils.StratumKawPoWAddrFlag.Name),
+				APIAddr:    viper.GetString(utils.StratumAPIAddrFlag.Name),
 			}
 
-			// Start stratum API server for dashboard
-			apiAddr := viper.GetString(utils.StratumAPIAddrFlag.Name)
-			stratumAPI = stratum.NewAPI(apiAddr, stratumServer.Stats(), zoneBackend)
-			if err := stratumAPI.Start(); err != nil {
-				log.Global.WithField("error", err).Error("failed to start stratum API")
+			stratumManager = stratum.NewManager(cfg, zoneBackend)
+			if err := stratumManager.Start(); err != nil {
+				log.Global.WithField("error", err).Error("failed to start stratum servers")
 			} else {
-				log.Global.WithField("addr", apiAddr).Info("Stratum API started")
+				log.Global.WithFields(log.Fields{
+					"sha":    cfg.SHAAddr,
+					"scrypt": cfg.ScryptAddr,
+					"kawpow": cfg.KawPoWAddr,
+					"api":    cfg.APIAddr,
+				}).Info("Stratum servers started")
 			}
 		}
 	}
@@ -173,11 +175,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	cancel()
 	// stop the hierarchical co-ordinator
 	hc.Stop()
-	if stratumAPI != nil {
-		_ = stratumAPI.Stop()
-	}
-	if stratumServer != nil {
-		_ = stratumServer.Stop()
+	if stratumManager != nil {
+		_ = stratumManager.Stop()
 	}
 	if err := node.Stop(); err != nil {
 		panic(err)

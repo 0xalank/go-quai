@@ -60,7 +60,6 @@ var Flags = [][]Flag{
 	PeersFlags,
 	MetricsFlags,
 	StratumFlags,
-	DashboardFlags,
 }
 
 var GlobalFlags = []Flag{
@@ -627,6 +626,7 @@ var (
 var StratumFlags = []Flag{
 	StratumEnabledFlag,
 	StratumAddrFlag,
+	StratumAPIAddrFlag,
 }
 
 var (
@@ -640,26 +640,10 @@ var (
 		Value: "0.0.0.0:3333",
 		Usage: "listen address for stratum-like TCP endpoint",
 	}
-)
-
-// ****************************************
-// **          DASHBOARD FLAGS           **
-// ****************************************
-var DashboardFlags = []Flag{
-	DashboardEnabledFlag,
-	DashboardAddrFlag,
-}
-
-var (
-	DashboardEnabledFlag = Flag{
-		Name:  c_NodeFlagPrefix + "dashboard-enabled",
-		Value: false,
-		Usage: "enable the web dashboard for node monitoring",
-	}
-	DashboardAddrFlag = Flag{
-		Name:  c_NodeFlagPrefix + "dashboard-addr",
-		Value: "0.0.0.0:8080",
-		Usage: "listen address for the web dashboard",
+	StratumAPIAddrFlag = Flag{
+		Name:  c_NodeFlagPrefix + "stratum-api-addr",
+		Value: "0.0.0.0:3334",
+		Usage: "listen address for stratum pool HTTP API (serves stats to dashboard)",
 	}
 )
 

@@ -1,9 +1,17 @@
 package stratum
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
+
+// TopMiner represents a miner's aggregated stats for leaderboard
+type TopMiner struct {
+	Address     string  `json:"address"`
+	Hashrate    float64 `json:"hashrate"`
+	WorkerCount int     `json:"workerCount"`
+}
 
 // WorkerStats tracks statistics for a connected miner
 type WorkerStats struct {
@@ -185,6 +193,37 @@ func (ps *PoolStats) GetConnectedWorkers() []WorkerStats {
 	return workers
 }
 
+// GetWorkersForAddress returns all workers for a specific address
+func (ps *PoolStats) GetWorkersForAddress(address string) []WorkerStats {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	workers := make([]WorkerStats, 0)
+	for _, w := range ps.workers {
+		if w.Address == address {
+			workers = append(workers, *w)
+		}
+	}
+	return workers
+}
+
+// GetMinerAddresses returns unique miner addresses
+func (ps *PoolStats) GetMinerAddresses() []string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	addressMap := make(map[string]bool)
+	for _, w := range ps.workers {
+		addressMap[w.Address] = true
+	}
+
+	addresses := make([]string, 0, len(addressMap))
+	for addr := range addressMap {
+		addresses = append(addresses, addr)
+	}
+	return addresses
+}
+
 // GetBlocks returns found blocks
 func (ps *PoolStats) GetBlocks() []BlockFound {
 	ps.mu.RLock()
@@ -229,15 +268,18 @@ func (ps *PoolStats) GetOverview() PoolOverview {
 
 // PoolOverview contains summary statistics
 type PoolOverview struct {
-	WorkersTotal     int       `json:"workersTotal"`
-	WorkersConnected int       `json:"workersConnected"`
-	Hashrate         float64   `json:"hashrate"`
-	SharesValid      uint64    `json:"sharesValid"`
-	SharesStale      uint64    `json:"sharesStale"`
-	SharesInvalid    uint64    `json:"sharesInvalid"`
-	BlocksFound      int       `json:"blocksFound"`
-	Uptime           float64   `json:"uptime"`
-	StartedAt        time.Time `json:"startedAt"`
+	WorkersTotal      int        `json:"workersTotal"`
+	WorkersConnected  int        `json:"workersConnected"`
+	Hashrate          float64    `json:"hashrate"`
+	SharesValid       uint64     `json:"sharesValid"`
+	SharesStale       uint64     `json:"sharesStale"`
+	SharesInvalid     uint64     `json:"sharesInvalid"`
+	BlocksFound       int        `json:"blocksFound"`
+	Uptime            float64    `json:"uptime"`
+	StartedAt         time.Time  `json:"startedAt"`
+	NetworkHashrate   float64    `json:"networkHashrate,omitempty"`
+	NetworkDifficulty float64    `json:"networkDifficulty,omitempty"`
+	TopMiners         []TopMiner `json:"topMiners,omitempty"`
 }
 
 // pruneShareWindow removes old share events outside the window
@@ -283,4 +325,46 @@ func (ps *PoolStats) GetTotalHashrate() float64 {
 		}
 	}
 	return total
+}
+
+// GetTopMiners returns miners sorted by hashrate (aggregated by address)
+func (ps *PoolStats) GetTopMiners(limit int) []TopMiner {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	// Aggregate workers by address
+	minerMap := make(map[string]*TopMiner)
+	for _, w := range ps.workers {
+		if !w.IsConnected {
+			continue
+		}
+		if miner, exists := minerMap[w.Address]; exists {
+			miner.Hashrate += w.Hashrate
+			miner.WorkerCount++
+		} else {
+			minerMap[w.Address] = &TopMiner{
+				Address:     w.Address,
+				Hashrate:    w.Hashrate,
+				WorkerCount: 1,
+			}
+		}
+	}
+
+	// Convert to slice
+	miners := make([]TopMiner, 0, len(minerMap))
+	for _, m := range minerMap {
+		miners = append(miners, *m)
+	}
+
+	// Sort by hashrate descending
+	sort.Slice(miners, func(i, j int) bool {
+		return miners[i].Hashrate > miners[j].Hashrate
+	})
+
+	// Limit results
+	if limit > 0 && len(miners) > limit {
+		miners = miners[:limit]
+	}
+
+	return miners
 }

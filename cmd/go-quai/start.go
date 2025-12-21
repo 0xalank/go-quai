@@ -12,7 +12,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/dominant-strategies/go-quai/dashboard"
 	"github.com/dominant-strategies/go-quai/metrics_config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -119,6 +118,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// Optionally start stratum-like TCP server when enabled and a zone backend is available
 	var stratumServer *stratum.Server
+	var stratumAPI *stratum.API
 	if viper.GetBool(utils.StratumEnabledFlag.Name) {
 		addr := viper.GetString(utils.StratumAddrFlag.Name)
 		if zoneBackend == nil {
@@ -128,51 +128,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 			if err := stratumServer.Start(); err != nil {
 				log.Global.WithField("error", err).Error("failed to start stratum endpoint")
 			} else {
-				log.Global.WithField("addr", addr).Info("Stratum-like TCP endpoint started")
+				log.Global.WithField("addr", addr).Info("Stratum TCP endpoint started")
 			}
-		}
-	}
 
-	// Optionally start web dashboard when enabled
-	var dashboardServer *dashboard.Dashboard
-	if viper.GetBool(utils.DashboardEnabledFlag.Name) {
-		dashboardAddr := viper.GetString(utils.DashboardAddrFlag.Name)
-
-		// Build connection URLs
-		httpHost := viper.GetString(utils.HTTPListenAddrFlag.Name)
-		httpPort := viper.GetInt(utils.HTTPPortStartFlag.Name)
-		wsHost := viper.GetString(utils.WSListenAddrFlag.Name)
-		wsPort := viper.GetInt(utils.WSPortStartFlag.Name)
-		stratumAddr := viper.GetString(utils.StratumAddrFlag.Name)
-
-		rpcURL := "http://" + httpHost + ":" + strconv.Itoa(httpPort)
-		wsURL := "ws://" + wsHost + ":" + strconv.Itoa(wsPort)
-		stratumURL := "stratum+tcp://" + stratumAddr
-
-		// Get location string
-		locationStr := "-"
-		if zoneBackend != nil {
-			loc := zoneBackend.NodeLocation()
-			locationStr = loc.Name()
-		}
-
-		dashboardServer = dashboard.New(dashboard.Config{
-			Addr:        dashboardAddr,
-			Stratum:     stratumServer,
-			Blockchain:  zoneBackend,
-			RPCAddr:     rpcURL,
-			WSAddr:      wsURL,
-			StratumAddr: stratumURL,
-			Version:     params.Version.Full(),
-			Network:     network,
-			Location:    locationStr,
-			ChainID:     9000, // TODO: get from chain config
-			// P2P and Node stats can be added here when interfaces are implemented
-		})
-		if err := dashboardServer.Start(); err != nil {
-			log.Global.WithField("error", err).Error("failed to start dashboard")
-		} else {
-			log.Global.WithField("addr", dashboardAddr).Info("Web dashboard started")
+			// Start stratum API server for dashboard
+			apiAddr := viper.GetString(utils.StratumAPIAddrFlag.Name)
+			stratumAPI = stratum.NewAPI(apiAddr, stratumServer.Stats(), zoneBackend)
+			if err := stratumAPI.Start(); err != nil {
+				log.Global.WithField("error", err).Error("failed to start stratum API")
+			} else {
+				log.Global.WithField("addr", apiAddr).Info("Stratum API started")
+			}
 		}
 	}
 
@@ -207,8 +173,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	cancel()
 	// stop the hierarchical co-ordinator
 	hc.Stop()
-	if dashboardServer != nil {
-		_ = dashboardServer.Stop()
+	if stratumAPI != nil {
+		_ = stratumAPI.Stop()
 	}
 	if stratumServer != nil {
 		_ = stratumServer.Stop()
